@@ -6,7 +6,7 @@ import fs from 'fs';
 import fetch from 'node-fetch';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import Audio2TextJS from 'Audio2TextJS';
+import Audio2TextJS from 'audio2textjs';
 import crypto from 'crypto';
 import sqlite3 from 'better-sqlite3';
 
