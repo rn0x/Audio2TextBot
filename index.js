@@ -230,7 +230,11 @@ const handleMediaMessage = async (ctx, media) => {
     }
 };
 
-// Function to process media files recorded in requests
+/**
+ * Process media files recorded in requests from the database.
+ * Retries processing every 10 seconds if no requests are found.
+ * Logs errors encountered during processing.
+ */
 const processMediaFiles = async () => {
     try {
         const query = 'SELECT * FROM requests';
@@ -242,69 +246,131 @@ const processMediaFiles = async () => {
         }
 
         for (const request of requests) {
-            const { chat_id, message_id, file_url, file_path } = request;
-
-            await downloadFile(file_url, file_path);
-
-            const fileHash = await calculateFileHash(file_path);
-
-            const queryHash = 'SELECT * FROM hashes WHERE fileHash = ?';
-            const existingHash = db.prepare(queryHash).get(fileHash);
-
-            if (existingHash) {
-                const message = `✅ Conversion completed successfully:\n\n${existingHash.textRAW}`
-                const messagetrun = truncateText(message);
-                await bot.telegram.sendMessage(chat_id, messagetrun, {
-                    reply_to_message_id: message_id
-                });
-                executeQuery('DELETE FROM requests WHERE id = ?', [request.id]);
-                if (fs.existsSync(file_path)) await fs.promises.unlink(file_path);
-                setTimeout(processMediaFiles, 10 * 1000);
-                return;
+            try {
+                await processRequest(request);
+            } catch (error) {
+                console.error(`Error processing request ${request.id}:`, error.message);
             }
-
-            const result = await sttConverter.runWhisper(file_path, process.env.WHISPER_MODEL, process.env.WHISPER_LANGUAGE);
-
-            if (result.success) {
-                const message = `✅ Conversion completed successfully:\n\n${result.output[1].data}`
-                const messagetrun = truncateText(message);
-                await bot.telegram.sendMessage(chat_id, messagetrun, {
-                    reply_to_message_id: message_id
-                });
-                await bot.telegram.sendDocument(chat_id, { source: fs.readFileSync(`${file_path}.OUTPUT.wav.json`), filename: 'text.json' }, {
-                    reply_to_message_id: message_id
-                });
-                await bot.telegram.sendDocument(chat_id, { source: fs.readFileSync(`${file_path}.OUTPUT.wav.txt`), filename: 'text.txt' }, {
-                    reply_to_message_id: message_id
-                });
-                await bot.telegram.sendDocument(chat_id, { source: fs.readFileSync(`${file_path}.OUTPUT.wav.csv`), filename: 'text.csv' }, {
-                    reply_to_message_id: message_id
-                });
-            } else {
-                await bot.telegram.sendMessage(chat_id, `❌ Conversion failed:\n${result.message}`, {
-                    reply_to_message_id: message_id
-                });
-            }
-
-            const insertHashQuery = `
-                INSERT INTO hashes (fileHash, chat_id, file_url, textRAW)
-                VALUES (?, ?, ?, ?)
-            `;
-            executeQuery(insertHashQuery, [fileHash, chat_id, file_url || '', result.output[1].data || '']);
-
-            if (fs.existsSync(file_path)) await fs.promises.unlink(file_path);
-            if (fs.existsSync(`${file_path}.OUTPUT.wav`)) await fs.promises.unlink(`${file_path}.OUTPUT.wav`);
-            if (fs.existsSync(`${file_path}.OUTPUT.wav.json`)) await fs.promises.unlink(`${file_path}.OUTPUT.wav.json`);
-            if (fs.existsSync(`${file_path}.OUTPUT.wav.txt`)) await fs.promises.unlink(`${file_path}.OUTPUT.wav.txt`);
-            if (fs.existsSync(`${file_path}.OUTPUT.wav.csv`)) await fs.promises.unlink(`${file_path}.OUTPUT.wav.csv`);
-
-            executeQuery('DELETE FROM requests WHERE id = ?', [request.id]);
         }
 
         setTimeout(processMediaFiles, 10 * 1000);
     } catch (error) {
         console.error('Error processing media files:', error.message);
         setTimeout(processMediaFiles, 10 * 1000);
+    }
+};
+
+/**
+ * Process a single media file request.
+ * Downloads the file, calculates its hash, performs conversion if necessary,
+ * sends success or failure messages, and cleans up files.
+ *
+ * @param {Object} request - The request object containing request details.
+ * @param {number} request.id - The ID of the request.
+ * @param {number} request.chat_id - The ID of the chat to send messages to.
+ * @param {number} request.message_id - The ID of the message to reply to.
+ * @param {string} request.file_url - The URL of the file to download.
+ * @param {string} request.file_path - The local path to save the downloaded file.
+ */
+const processRequest = async (request) => {
+    const { id, chat_id, message_id, file_url, file_path } = request;
+
+    await downloadFile(file_url, file_path);
+
+    const fileHash = await calculateFileHash(file_path);
+
+    const existingHash = db.prepare('SELECT * FROM hashes WHERE fileHash = ?').get(fileHash);
+
+    try {
+        if (existingHash) {
+            const message = `✅ Conversion completed successfully:\n\n${truncateText(existingHash.textRAW)}`;
+            await sendMessage(chat_id, message, message_id);
+        } else {
+            const result = await sttConverter.runWhisper(file_path, process.env.WHISPER_MODEL, process.env.WHISPER_LANGUAGE);
+
+            if (result.success) {
+                const message = `✅ Conversion completed successfully:\n\n${truncateText(result.output[1].data)}`;
+                await sendMessage(chat_id, message, message_id);
+                await Promise.all([
+                    sendDocument(chat_id, `${file_path}.OUTPUT.wav.json`, 'text.json', message_id),
+                    sendDocument(chat_id, `${file_path}.OUTPUT.wav.txt`, 'text.txt', message_id),
+                    sendDocument(chat_id, `${file_path}.OUTPUT.wav.csv`, 'text.csv', message_id)
+                ]);
+                db.prepare(`
+                    INSERT INTO hashes (fileHash, chat_id, file_url, textRAW)
+                    VALUES (?, ?, ?, ?)
+                `).run(fileHash, chat_id, file_url || '', result.output[1].data || '');
+            } else {
+                console.log(`❌ Conversion failed:\n${result.message}`);
+                await sendMessage(chat_id, `❌ Conversion failed:\n${result.message}`, message_id);
+            }
+        }
+    } catch (error) {
+        console.error('Error sending message or document:', error.message);
+        await cleanupFiles(file_path);
+        db.prepare('DELETE FROM requests WHERE id = ?').run(id);
+        return; // Exit function early
+    }
+
+    await cleanupFiles(file_path);
+    db.prepare('DELETE FROM requests WHERE id = ?').run(id);
+};
+
+/**
+ * Clean up temporary files associated with a processed request.
+ *
+ * @param {string} file_path - The path to the main file and associated output files.
+ */
+const cleanupFiles = async (file_path) => {
+    try {
+        if (fs.existsSync(file_path)) await fs.promises.unlink(file_path);
+        if (fs.existsSync(`${file_path}.OUTPUT.wav`)) await fs.promises.unlink(`${file_path}.OUTPUT.wav`);
+        await Promise.all([
+            `${file_path}.OUTPUT.wav.json`,
+            `${file_path}.OUTPUT.wav.txt`,
+            `${file_path}.OUTPUT.wav.csv`
+        ].map(async (ext) => {
+            if (fs.existsSync(ext)) await fs.promises.unlink(ext);
+        }));
+    } catch (error) {
+        console.error('Error cleaning up files:', error.message);
+        throw error;
+    }
+};
+
+/**
+ * Sends a text message to a Telegram chat.
+ *
+ * @param {number|string} chat_id - The ID of the chat where the message will be sent.
+ * @param {string} text - The text message content.
+ * @param {number} [reply_to_message_id] - (Optional) ID of the message to reply to.
+ * @throws {Error} If there is an error sending the message.
+ */
+const sendMessage = async (chat_id, text, reply_to_message_id) => {
+    try {
+        await bot.telegram.sendMessage(chat_id, text, { reply_to_message_id });
+    } catch (error) {
+        console.error('Error sending message:', error.message);
+        throw error;
+    }
+};
+
+/**
+ * Sends a document (file) to a Telegram chat.
+ *
+ * @param {number|string} chat_id - The ID of the chat where the document will be sent.
+ * @param {string} filePath - The path to the file to be sent.
+ * @param {string} fileName - The name of the file.
+ * @param {number} [reply_to_message_id] - (Optional) ID of the message to reply to.
+ * @throws {Error} If there is an error sending the document.
+ */
+const sendDocument = async (chat_id, filePath, fileName, reply_to_message_id) => {
+    try {
+        const source = fs.readFileSync(filePath);
+        await bot.telegram.sendDocument(chat_id, { source, filename: fileName }, { reply_to_message_id });
+    } catch (error) {
+        console.error('Error sending document:', error.message);
+        throw error;
     }
 };
 
